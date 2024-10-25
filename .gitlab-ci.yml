@@ -1,0 +1,71 @@
+image: golang:1.19
+
+stages:
+  - test
+  - post release
+
+include:
+  - template: Dependency-Scanning.gitlab-ci.yml
+  - template: SAST.gitlab-ci.yml
+  - template: Secret-Detection.gitlab-ci.yml
+  - component: ${CI_SERVER_FQDN}/gitlab-org/components/danger-review/danger-review@1.4.1
+    inputs:
+      job_image: "registry.gitlab.com/gitlab-org/security-products/danger-bot:${DANGER_BOT_VERSION}"
+
+test:
+  script:
+    - go get -t ./...
+    - go test -race -cover -v ./...
+  coverage: '/coverage: \d+.\d+% of statements/'
+
+lint_code:
+  script:
+    - go install honnef.co/go/tools/cmd/staticcheck@latest
+    - go vet ./...
+    - staticcheck ./...
+
+go mod tidy:
+  script:
+    - go mod tidy
+    - git diff --exit-code go.mod go.sum
+
+update_analyzers:
+  image: alpine:3.10.4
+  stage: post release
+  when: manual
+  allow_failure: false
+  variables:
+    ANALYZERS_GROUP_ID: 2564205
+    PROJECTS_PAGE_SIZE: 100
+    PIPELINE_DATA: >
+      {"ref":"master","variables":[{"key":"MAINTENANCE","value":"true"},{"key":"COMMON_COMMIT_TAG","value":"$CI_COMMIT_TAG"}]}
+
+  only:
+    - tags
+  script:
+    - apk update && apk add jq curl
+    - "project_ids=${PROJECT_IDS:-$(curl -s --header \"PRIVATE-TOKEN:$GITLAB_TOKEN\" \"$CI_API_V4_URL/groups/$ANALYZERS_GROUP_ID/projects?per_page=$PROJECTS_PAGE_SIZE\" | jq '.[] | select(contains({tag_list: [\"GL-Secure Analyzer\"]}) and (.name != \"common\")) | .id')}"
+    - for project_id in $project_ids; do curl --request POST --header "PRIVATE-TOKEN:$GITLAB_TOKEN" --header "Content-Type:application/json" --data $PIPELINE_DATA $CI_API_V4_URL/projects/$project_id/pipeline;done
+
+danger-review:
+  rules:
+    - if: $CI_DEFAULT_BRANCH == $CI_COMMIT_REF_NAME
+      when: never
+    - if: $DANGER_DISABLED
+      when: never
+    - if: '$CI_COMMIT_BRANCH && $CI_PROJECT_NAMESPACE == "gitlab-org/security-products/analyzers"'
+    - when: never
+  variables:
+    DANGER_BOT_VERSION: v0.0.9
+  script:
+    - cp -r /danger/ danger/
+    - mv danger/analyzers/Dangerfile Dangerfile
+    - |
+      if [ -f danger/Gemfile ]; then
+        mv danger/Gemfile Gemfile
+        bundle config set path danger/vendor/
+        bundle exec danger --fail-on-errors=true
+      else
+        danger --fail-on-errors=true
+      fi
+
